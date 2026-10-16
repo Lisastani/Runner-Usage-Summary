@@ -1,0 +1,560 @@
+import atexit
+import csv
+import gzip
+import hashlib
+import http.client
+import io
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urljoin, urlparse
+from urllib.request import Request, getproxies, proxy_bypass, urlopen
+
+# -------- CONFIGURATION --------
+ORG = "ORGANIZATION"
+OUTPUT_DIR = "."
+
+PER_PAGE = 100
+API_VERSION = "2022-11-28"
+# -------------------------------
+
+BASE_URL = "https://api.(ORG).ghe.com"
+HEADERS = {
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": API_VERSION,
+    "User-Agent": "organization-runner-audit",
+}
+
+
+def get_token():
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "GitHub CLI (gh) is not installed or is not on PATH."
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Cannot get a GitHub token. Run: gh auth login"
+        ) from exc
+
+    token = result.stdout.strip()
+    if not token:
+        raise RuntimeError("GitHub CLI returned an empty token.")
+    return token
+
+
+_cache_db = None
+_connections = {}
+
+
+class _Response:
+    def __init__(self, raw, headers):
+        self.raw = raw
+        self.headers = headers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def read(self):
+        return self.raw
+
+
+def _open(request, timeout):
+    parsed = urlparse(request.full_url)
+    if parsed.scheme not in ("http", "https") or (
+        getproxies().get(parsed.scheme) and not proxy_bypass(parsed.hostname)
+    ):
+        return urlopen(request, timeout=timeout)
+
+    key = (parsed.scheme, parsed.hostname, parsed.port)
+    connection = _connections.get(key)
+    if connection is None:
+        factory = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https" else http.client.HTTPConnection
+        )
+        connection = factory(parsed.hostname, port=parsed.port, timeout=timeout)
+        _connections[key] = connection
+
+    try:
+        connection.request(
+            "GET", request.selector, headers=dict(request.header_items())
+        )
+        response = connection.getresponse()
+        raw = response.read()
+        status = response.status
+        reason = response.reason
+        headers = response.headers
+        response.close()
+    except (OSError, http.client.HTTPException) as exc:
+        connection.close()
+        _connections.pop(key, None)
+        raise URLError(exc) from exc
+
+    if status in (301, 302, 303, 307, 308):
+        location = headers.get("Location")
+        if not location:
+            raise HTTPError(
+                request.full_url, status, reason, headers, io.BytesIO(raw)
+            )
+        redirected = Request(
+            urljoin(request.full_url, location),
+            headers=dict(request.header_items()),
+            method="GET",
+        )
+        return urlopen(redirected, timeout=timeout)
+    if status >= 400 or status == 304:
+        raise HTTPError(
+            request.full_url, status, reason, headers, io.BytesIO(raw)
+        )
+    return _Response(raw, headers)
+
+
+def _close_connections():
+    for connection in _connections.values():
+        connection.close()
+    _connections.clear()
+
+
+atexit.register(_close_connections)
+
+
+def _close_cache():
+    global _cache_db
+    if _cache_db is not None:
+        _cache_db.close()
+        _cache_db = None
+
+
+atexit.register(_close_cache)
+
+
+def _get_cache():
+    global _cache_db
+    if _cache_db is None:
+        path = os.path.join(OUTPUT_DIR, ".runner_usage_cache.sqlite3")
+        db = sqlite3.connect(path)
+        try:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS responses ("
+                "identity TEXT NOT NULL, url TEXT NOT NULL, "
+                "etag TEXT NOT NULL, body BLOB NOT NULL, link TEXT NOT NULL, "
+                "PRIMARY KEY (identity, url))"
+            )
+            db.commit()
+        except sqlite3.Error:
+            db.close()
+            raise
+        _cache_db = db
+    return _cache_db
+
+
+def _retry_after(value):
+    if not value:
+        return None
+    try:
+        return max(0, int(value))
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0, when.timestamp() - time.time())
+
+
+def api_get(url, token):
+    headers = dict(HEADERS)
+    headers["Authorization"] = f"Bearer {token}"
+    headers["Accept-Encoding"] = "gzip"
+
+    identity = hashlib.sha256(
+        json.dumps(
+            [token, HEADERS], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+    try:
+        db = _get_cache()
+        cached = db.execute(
+            "SELECT etag, body, link FROM responses "
+            "WHERE identity = ? AND url = ?",
+            (identity, url),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Cannot read API response cache: {exc}") from exc
+
+    if cached:
+        headers["If-None-Match"] = cached[0]
+
+    for attempt in range(5):
+        request = Request(url, headers=headers, method="GET")
+        try:
+            with _open(request, timeout=60) as response:
+                raw = response.read()
+                if response.headers.get("Content-Encoding", "").lower() == "gzip":
+                    raw = gzip.decompress(raw)
+                body = json.loads(raw.decode("utf-8"))
+                link = response.headers.get("Link", "")
+                etag = response.headers.get("ETag")
+                directives = {
+                    part.strip().split("=", 1)[0].lower()
+                    for part in response.headers.get("Cache-Control", "").split(",")
+                }
+                try:
+                    if etag and "no-store" not in directives:
+                        db.execute(
+                            "INSERT OR REPLACE INTO responses "
+                            "(identity, url, etag, body, link) VALUES (?, ?, ?, ?, ?)",
+                            (identity, url, etag, raw, link),
+                        )
+                    else:
+                        db.execute(
+                            "DELETE FROM responses WHERE identity = ? AND url = ?",
+                            (identity, url),
+                        )
+                    db.commit()
+                except sqlite3.Error as exc:
+                    db.rollback()
+                    raise RuntimeError(
+                        f"Cannot update API response cache: {exc}"
+                    ) from exc
+                return body, link
+
+        except HTTPError as exc:
+            try:
+                if exc.code == 304:
+                    if cached is None:
+                        raise RuntimeError(
+                            f"GitHub returned HTTP 304 without a cached response for {url}"
+                        ) from exc
+                    return (
+                        json.loads(cached[1].decode("utf-8")),
+                        exc.headers.get("Link", cached[2]),
+                    )
+
+                raw = exc.read()
+                if exc.headers.get("Content-Encoding", "").lower() == "gzip":
+                    raw = gzip.decompress(raw)
+                message = raw.decode("utf-8", errors="replace")
+                remaining = exc.headers.get("X-RateLimit-Remaining")
+                reset = exc.headers.get("X-RateLimit-Reset")
+                retry_after = _retry_after(exc.headers.get("Retry-After"))
+                rate_limited = exc.code == 429 or (
+                    exc.code == 403
+                    and (
+                        remaining == "0"
+                        or retry_after is not None
+                        or "rate limit" in message.lower()
+                        or "abuse detection" in message.lower()
+                    )
+                )
+
+                if rate_limited or exc.code >= 500:
+                    if attempt == 4:
+                        raise RuntimeError(
+                            f"Retries exhausted for {url}: HTTP {exc.code}\n"
+                            f"{message[:1000]}"
+                        ) from exc
+                    if retry_after is not None:
+                        wait = retry_after
+                    elif remaining == "0" and reset:
+                        wait = max(1, int(reset) - int(time.time()) + 2)
+                    elif rate_limited:
+                        wait = 60 * (2 ** attempt)
+                    else:
+                        wait = 2 ** attempt
+                    if remaining == "0" and reset and retry_after is None:
+                        print(f"Rate limit reached; waiting {wait}s.")
+                    else:
+                        print(f"HTTP {exc.code}; retrying in {wait:g}s.")
+                else:
+                    raise RuntimeError(
+                        f"GitHub API returned HTTP {exc.code} for {url}\n"
+                        f"{message[:1000]}"
+                    ) from exc
+            finally:
+                exc.close()
+            time.sleep(wait)
+
+        except URLError as exc:
+            if attempt == 4:
+                raise RuntimeError(
+                    f"Network error requesting {url}: {exc}"
+                ) from exc
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError(f"Retries exhausted for {url}")
+
+
+def get_all_pages(url, token, list_key=None):
+    """Follow GitHub's Link header until no next page remains."""
+    results = []
+
+    while url:
+        data, link_header = api_get(url, token)
+
+        if list_key is None:
+            if not isinstance(data, list):
+                raise RuntimeError(f"Expected a JSON array from {url}")
+            results.extend(data)
+        else:
+            results.extend(data.get(list_key, []))
+
+        next_url = None
+        for part in link_header.split(","):
+            match = re.match(r'\s*<([^>]+)>\s*;\s*rel="([^"]+)"', part)
+            if match and match.group(2) == "next":
+                next_url = match.group(1)
+                break
+
+        url = next_url
+
+    return results
+
+
+def write_csv(path, columns, rows):
+    with open(path, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main():
+    if ORG == "YOUR_ORGANIZATION":
+        sys.exit(
+            'Edit the script and replace ORG = "YOUR_ORGANIZATION".'
+        )
+
+    org = ORG.strip()
+    token = get_token()
+
+    org_url = f"{BASE_URL}/orgs/{org}"
+    org_data, _ = api_get(org_url, token)
+    org = org_data["login"]
+
+    print(f"Organization: {org}")
+    print("Fetching repositories...")
+
+    repos_url = (
+        f"{BASE_URL}/orgs/{org}/repos?"
+        + urlencode({"type": "all", "per_page": PER_PAGE})
+    )
+    repos = get_all_pages(repos_url, token)
+
+    print(f"Repositories visible to this account: {len(repos)}")
+
+    detail_rows = []
+    errors = []
+    repo_runner_stats = defaultdict(list)
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=90)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for index, repo in enumerate(repos, start=1):
+        owner = repo["owner"]["login"]
+        name = repo["name"]
+        full_name = f"{owner}/{name}"
+
+        print(
+            f"[{index}/{len(repos)}] {full_name}",
+            flush=True,
+        )
+
+        try:
+            runs_url = (
+                f"{BASE_URL}/repos/{owner}/{name}/actions/runs?"
+                + urlencode({
+                    "per_page": PER_PAGE,
+                    "created": f">={cutoff}",
+                })
+            )
+            runs = get_all_pages(
+                runs_url, token, list_key="workflow_runs"
+            )
+
+            for run_index, run in enumerate(runs, start=1):
+                run_id = run["id"]
+                jobs_url = (
+                    f"{BASE_URL}/repos/{owner}/{name}/actions/"
+                    f"runs/{run_id}/jobs?"
+                    + urlencode({
+                        "per_page": PER_PAGE,
+                        "filter": "all",
+                    })
+                )
+                jobs = get_all_pages(
+                    jobs_url, token, list_key="jobs"
+                )
+
+                for job in jobs:
+                    runner_id = job.get("runner_id")
+                    runner_name = job.get("runner_name")
+
+                    if runner_id is None or not runner_name:
+                        continue
+
+                    if not job.get("started_at"):
+                        continue
+
+                    labels = job.get("labels") or []
+                    label_text = ", ".join(labels)
+
+                    row = {
+                        "organization": org,
+                        "repository": full_name,
+                        "runner_id": runner_id,
+                        "runner_name": runner_name,
+                        "runner_group": job.get("runner_group_name") or "",
+                        "job_name": job.get("name") or "",
+                        "job_status": job.get("status") or "",
+                        "job_conclusion": job.get("conclusion") or "",
+                        "job_started_at": job.get("started_at") or "",
+                        "job_completed_at": job.get("completed_at") or "",
+                        "job_labels": label_text,
+                        "workflow": (
+                            job.get("workflow_name")
+                            or run.get("name")
+                            or ""
+                        ),
+                        "run_id": run_id,
+                        "run_attempt": run.get("run_attempt", ""),
+                        "run_url": run.get("html_url") or "",
+                        "branch": run.get("head_branch") or "",
+                        "commit_sha": run.get("head_sha") or "",
+                    }
+                    detail_rows.append(row)
+
+                    key = (
+                        str(runner_id),
+                        runner_name,
+                        full_name,
+                    )
+                    repo_runner_stats[key].append(row)
+
+                if run_index % 25 == 0:
+                    print(
+                        "  Still processing workflow runs...",
+                        flush=True,
+                    )
+
+        except Exception as exc:
+            message = str(exc)
+            print(f"  ERROR: {message}", flush=True)
+            errors.append({
+                "repository": full_name,
+                "error": message,
+            })
+
+    detail_columns = [
+        "organization", "repository", "runner_id", "runner_name",
+        "runner_group", "job_name", "job_status", "job_conclusion",
+        "job_started_at", "job_completed_at", "job_labels",
+        "workflow", "run_id", "run_attempt", "run_url",
+        "branch", "commit_sha",
+    ]
+
+    detail_rows.sort(
+        key=lambda r: (
+            r["runner_name"].casefold(),
+            r["repository"].casefold(),
+            r["job_started_at"],
+        )
+    )
+
+    write_csv(
+        os.path.join(OUTPUT_DIR, "runner_usage_details.csv"),
+        detail_columns,
+        detail_rows,
+    )
+
+    summary_rows = []
+    for (runner_id, runner_name, repository), jobs in sorted(
+        repo_runner_stats.items(),
+        key=lambda item: (
+            item[0][1].casefold(),
+            item[0][2].casefold(),
+        ),
+    ):
+        dates = [
+            row["job_started_at"]
+            for row in jobs
+            if row["job_started_at"]
+        ]
+        summary_rows.append({
+            "organization": org,
+            "runner_id": runner_id,
+            "runner_name": runner_name,
+            "repository": repository,
+            "matching_job_count": len(jobs),
+            "first_seen": min(dates) if dates else "",
+            "last_seen": max(dates) if dates else "",
+            "latest_job_url": max(
+                jobs,
+                key=lambda row: row["job_started_at"],
+            )["run_url"],
+        })
+
+    summary_columns = [
+        "organization", "runner_id", "runner_name", "repository",
+        "matching_job_count", "first_seen", "last_seen",
+        "latest_job_url",
+    ]
+
+    write_csv(
+        os.path.join(OUTPUT_DIR, "runner_usage_summary.csv"),
+        summary_columns,
+        summary_rows,
+    )
+
+    write_csv(
+        os.path.join(OUTPUT_DIR, "runner_usage_errors.csv"),
+        ["repository", "error"],
+        errors,
+    )
+
+    unique_runners = {
+        (row["runner_id"], row["runner_name"])
+        for row in detail_rows
+    }
+    unique_repos = {
+        row["repository"] for row in detail_rows
+    }
+
+    print("\nFinished.")
+    print(f"Repositories inspected: {len(repos)}")
+    print(f"Repositories with matching jobs: {len(unique_repos)}")
+    print(f"Runner IDs observed: {len(unique_runners)}")
+    print(f"Matching job records: {len(detail_rows)}")
+    print(f"Repositories with errors: {len(errors)}")
+    print(f"Detailed report: {os.path.abspath('runner_usage_details.csv')}")
+    print(f"Summary report:  {os.path.abspath('runner_usage_summary.csv')}")
+    print(f"Errors report:   {os.path.abspath('runner_usage_errors.csv')}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, KeyError, ValueError) as exc:
+        print(f"\nFATAL ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+ 
